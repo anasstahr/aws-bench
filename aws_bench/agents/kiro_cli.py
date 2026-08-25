@@ -35,6 +35,7 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 
+from aws_bench.agents.rules_file import RulesFileMixin
 from aws_bench.cli.preflight import PreflightError
 
 _OUTPUT_FILENAME = "kiro-cli.txt"
@@ -45,10 +46,17 @@ _CONTAINER_DB_PATH = "~/.local/share/kiro-cli/data.sqlite3"
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
 
 
-class KiroCli(BaseInstalledAgent):
-    """Kiro CLI agent — runs tasks in headless mode via kiro-cli chat."""
+class KiroCli(RulesFileMixin, BaseInstalledAgent):
+    """Kiro CLI agent — runs tasks in headless mode via kiro-cli chat.
+
+    Also injects an optional ``rules_file`` (``--ak rules_file=...``) as a Kiro
+    steering doc at ``.kiro/steering/aws-agent-rules.md``; see
+    :class:`RulesFileMixin`.
+    """
 
     SUPPORTS_ATIF: bool = True
+
+    RULES_FILE_TARGET = ".kiro/steering/aws-agent-rules.md"
 
     CLI_FLAGS = [
         CliFlag(
@@ -182,6 +190,9 @@ class KiroCli(BaseInstalledAgent):
                 ),
                 env=env or None,
             )
+
+        # Write the optional rules file into .kiro/steering/ before the run.
+        await self._write_rules_file(environment)
 
         run_command = (
             f"{_PATH_PREFIX}"

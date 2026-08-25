@@ -186,3 +186,30 @@ async def test_rewrites_github_ssh_to_https(plugin_agent: ClaudeCode):
     await plugin_agent.install(environment)
 
     assert any("insteadOf" in c and "git@github.com:" in c for c in _commands(environment))
+
+
+# ── rules file ──
+
+
+def test_defaults_to_no_rules_file(logs_dir: Path):
+    """No rules file is tracked without the kwarg."""
+    assert ClaudeCode(logs_dir=logs_dir)._rules_file is None
+
+
+@pytest.mark.asyncio
+async def test_run_writes_rules_file_as_claude_md(logs_dir: Path, tmp_path: Path):
+    """The rules file is injected as CLAUDE.md before the claude run."""
+    rules = tmp_path / "aws-agent-rules.md"
+    rules.write_text("# AWS rules\n", encoding="utf-8")
+    agent = ClaudeCode(logs_dir=logs_dir, rules_file=str(rules))
+    environment = _fresh_environment()
+
+    await agent.run("Do the task", environment, MagicMock())
+
+    commands = _commands(environment)
+    rules_cmds = [c for c in commands if "base64 -d >> CLAUDE.md" in c]
+    assert rules_cmds
+    # Written before claude --print runs.
+    rules_idx = next(i for i, c in enumerate(commands) if "base64 -d >> CLAUDE.md" in c)
+    claude_idx = next(i for i, c in enumerate(commands) if "claude --verbose" in c)
+    assert rules_idx < claude_idx

@@ -28,11 +28,19 @@ from harbor.agents.installed.codex import Codex as _HarborCodex
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from aws_bench.agents.rules_file import RulesFileMixin
+
 _DEFAULT_AWS_REGION = "us-east-2"
 
 
-class Codex(_HarborCodex):
-    """Codex agent that can target Amazon Bedrock in addition to OpenAI."""
+class Codex(RulesFileMixin, _HarborCodex):
+    """Codex agent that can target Amazon Bedrock in addition to OpenAI.
+
+    Also injects an optional ``rules_file`` (``--ak rules_file=...``) as
+    ``AGENTS.md`` in the agent's working directory; see :class:`RulesFileMixin`.
+    """
+
+    RULES_FILE_TARGET = "AGENTS.md"
 
     @staticmethod
     def _is_bedrock_mode() -> bool:
@@ -101,5 +109,6 @@ class Codex(_HarborCodex):
         if self._is_bedrock_mode():
             self._inject_bedrock_env()
             await self._write_bedrock_provider_config(environment)
+        await self._write_rules_file(environment)
         # super().run is decorated with @with_prompt_template; do not re-decorate.
         await super().run(instruction, environment, context)

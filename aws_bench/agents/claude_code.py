@@ -22,14 +22,23 @@ from pathlib import Path
 
 from harbor.agents.installed.claude_code import ClaudeCode as _HarborClaudeCode
 from harbor.environments.base import BaseEnvironment
+from harbor.models.agent.context import AgentContext
+
+from aws_bench.agents.rules_file import RulesFileMixin
 
 # claude installs to ~/.local/bin, which is off the PATH for the non-interactive
 # exec shell; prepend it so `claude plugin install` resolves.
 _PATH_RESTORE = 'export PATH="$HOME/.local/bin:$PATH"'
 
 
-class ClaudeCode(_HarborClaudeCode):
-    """Claude Code that installs plugins from marketplaces per trial."""
+class ClaudeCode(RulesFileMixin, _HarborClaudeCode):
+    """Claude Code that installs plugins from marketplaces per trial.
+
+    Also injects an optional ``rules_file`` (``--ak rules_file=...``) as
+    ``CLAUDE.md`` in the agent's working directory; see :class:`RulesFileMixin`.
+    """
+
+    RULES_FILE_TARGET = "CLAUDE.md"
 
     def __init__(
         self,
@@ -90,6 +99,19 @@ class ClaudeCode(_HarborClaudeCode):
             environment,
             command=('git config --global url."https://github.com/".insteadOf "git@github.com:"'),
         )
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        """Inject the optional rules file as CLAUDE.md, then defer to Harbor's run.
+
+        The rules file is written to the agent's working directory so a
+        subsequent ``claude --print`` (run with the same working directory)
+        picks it up as project memory. ``super().run`` is decorated with
+        ``@with_prompt_template``; this override must not be re-decorated.
+        """
+        await self._write_rules_file(environment)
+        await super().run(instruction, environment, context)
 
     def _build_register_mcp_servers_command(self) -> str | None:
         """Chain plugin installation onto the per-trial config setup command.

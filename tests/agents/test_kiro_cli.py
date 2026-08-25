@@ -170,6 +170,39 @@ class TestKiroCliRun:
         assert "test-server" in mcp_command
 
     @pytest.mark.asyncio
+    async def test_run_writes_rules_file_to_steering(self, logs_dir: Path, tmp_path: Path):
+        rules = tmp_path / "aws-agent-rules.md"
+        rules.write_text("# AWS rules\n", encoding="utf-8")
+        agent = KiroCli(logs_dir=logs_dir, rules_file=str(rules))
+        environment = MagicMock()
+        environment.exec = AsyncMock(return_value=MagicMock(return_code=0, stdout="", stderr=""))
+        context = MagicMock()
+
+        with patch.dict("os.environ", {"KIRO_API_KEY": "ksk_test"}, clear=True):
+            await agent.run("Do the task", environment, context)
+
+        commands = [c.kwargs.get("command", "") for c in environment.exec.call_args_list]
+        rules_cmds = [c for c in commands if ".kiro/steering/aws-agent-rules.md" in c]
+        assert rules_cmds
+        assert "base64 -d >>" in rules_cmds[0]
+        # Written before the chat command runs.
+        chat_idx = next(i for i, c in enumerate(commands) if "kiro-cli chat" in c)
+        rules_idx = next(i for i, c in enumerate(commands) if ".kiro/steering" in c)
+        assert rules_idx < chat_idx
+
+    @pytest.mark.asyncio
+    async def test_run_without_rules_file_writes_nothing(self, agent: KiroCli):
+        environment = MagicMock()
+        environment.exec = AsyncMock(return_value=MagicMock(return_code=0, stdout="", stderr=""))
+        context = MagicMock()
+
+        with patch.dict("os.environ", {"KIRO_API_KEY": "ksk_test"}, clear=True):
+            await agent.run("Do the task", environment, context)
+
+        commands = [c.kwargs.get("command", "") for c in environment.exec.call_args_list]
+        assert not any(".kiro/steering" in c for c in commands)
+
+    @pytest.mark.asyncio
     async def test_run_with_skills_dir(self, logs_dir: Path):
         agent = KiroCli(logs_dir=logs_dir, skills_dir="/harbor/skills")
         environment = MagicMock()
