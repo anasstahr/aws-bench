@@ -172,25 +172,22 @@ class KiroCli(BaseInstalledAgent):
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
 
-        # Stage skills where kiro-cli's default agent looks. The default agent
-        # scans both `.kiro/skills/*/SKILL.md` (workspace, relative to the run's
-        # cwd) and `~/.kiro/skills/*/SKILL.md` (global) and surfaces each skill's
-        # name/description in context (headless included), reading a full
-        # SKILL.md on demand. Copying only to ~/.kiro/skills has left the dir
-        # empty at chat time when the copy step's $HOME/cwd differed from the
-        # chat process, so we stage to BOTH locations. The echo/ls line records
-        # the resolved paths and file counts in the run log for debugging.
+        # Copy skills into ~/.kiro/skills/. kiro-cli's default agent loads skills
+        # from ~/.kiro/skills/ (global) at chat start, including in headless mode:
+        # it lists each skill's name/description and reads the full SKILL.md when
+        # a request matches. Verified with kiro-cli 2.21.2 that a skill present
+        # only in ~/.kiro/skills/ is discovered and used. The echo/ls line logs
+        # the resolved home and the number of skills copied, so a run that loads
+        # no skills is easy to diagnose (global=0 means the copy found nothing).
         if self.skills_dir:
             src = shlex.quote(self.skills_dir)
             await self.exec_as_agent(
                 environment,
                 command=(
-                    f'echo "kiro-skills: HOME=$HOME PWD=$PWD src={self.skills_dir}"; '
-                    f"mkdir -p ~/.kiro/skills .kiro/skills && "
+                    f'echo "kiro-skills: HOME=$HOME src={self.skills_dir}"; '
+                    f"mkdir -p ~/.kiro/skills && "
                     f"cp -r {src}/* ~/.kiro/skills/ 2>/dev/null || true; "
-                    f"cp -r {src}/* .kiro/skills/ 2>/dev/null || true; "
-                    f'echo "kiro-skills: global=$(ls ~/.kiro/skills 2>/dev/null | wc -l) '
-                    f'workspace=$(ls .kiro/skills 2>/dev/null | wc -l)"'
+                    f'echo "kiro-skills: global=$(ls ~/.kiro/skills 2>/dev/null | wc -l)"'
                 ),
                 env=env or None,
             )
