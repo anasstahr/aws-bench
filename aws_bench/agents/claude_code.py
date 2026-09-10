@@ -23,12 +23,14 @@ from pathlib import Path
 from harbor.agents.installed.claude_code import ClaudeCode as _HarborClaudeCode
 from harbor.environments.base import BaseEnvironment
 
+from aws_bench.agents._setup_cmd import AgentSetupCmdMixin
+
 # claude installs to ~/.local/bin, which is off the PATH for the non-interactive
 # exec shell; prepend it so `claude plugin install` resolves.
 _PATH_RESTORE = 'export PATH="$HOME/.local/bin:$PATH"'
 
 
-class ClaudeCode(_HarborClaudeCode):
+class ClaudeCode(AgentSetupCmdMixin, _HarborClaudeCode):
     """Claude Code that installs plugins from marketplaces per trial."""
 
     def __init__(
@@ -68,6 +70,7 @@ class ClaudeCode(_HarborClaudeCode):
         public marketplace clone.
         """
         await super().install(environment)
+        await self.run_setup_cmd(environment)
 
         if not self._plugins:
             return

@@ -28,11 +28,18 @@ from harbor.agents.installed.codex import Codex as _HarborCodex
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from aws_bench.agents._setup_cmd import AgentSetupCmdMixin
+
 _DEFAULT_AWS_REGION = "us-east-2"
 
 
-class Codex(_HarborCodex):
+class Codex(AgentSetupCmdMixin, _HarborCodex):
     """Codex agent that can target Amazon Bedrock in addition to OpenAI."""
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        """Install Codex, then run the optional in-container ``setup_cmd``."""
+        await super().install(environment)
+        await self.run_setup_cmd(environment)
 
     @staticmethod
     def _is_bedrock_mode() -> bool:

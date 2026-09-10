@@ -35,6 +35,7 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 
+from aws_bench.agents._setup_cmd import AgentSetupCmdMixin
 from aws_bench.cli.preflight import PreflightError
 
 _OUTPUT_FILENAME = "kiro-cli.txt"
@@ -45,7 +46,7 @@ _CONTAINER_DB_PATH = "~/.local/share/kiro-cli/data.sqlite3"
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
 
 
-class KiroCli(BaseInstalledAgent):
+class KiroCli(AgentSetupCmdMixin, BaseInstalledAgent):
     """Kiro CLI agent — runs tasks in headless mode via kiro-cli chat."""
 
     SUPPORTS_ATIF: bool = True
@@ -146,6 +147,7 @@ class KiroCli(BaseInstalledAgent):
                 "kiro-cli settings chat.greeting.enabled false"
             ),
         )
+        await self.run_setup_cmd(environment)
 
     @with_prompt_template
     async def run(
