@@ -176,18 +176,23 @@ class KiroCli(BaseInstalledAgent):
         # from ~/.kiro/skills/ (global) at chat start, including in headless mode:
         # it lists each skill's name/description and reads the full SKILL.md when
         # a request matches. Verified with kiro-cli 2.21.2 that a skill present
-        # only in ~/.kiro/skills/ is discovered and used. The echo/ls line logs
-        # the resolved home and the number of skills copied, so a run that loads
-        # no skills is easy to diagnose (global=0 means the copy found nothing).
+        # only in ~/.kiro/skills/ is discovered and used.
+        #
+        # Write the resolved home and copied-skill count to /logs/agent/ (which is
+        # collected with the run) rather than stdout: environment.exec discards
+        # command stdout, so an echoed marker would never surface in the logs.
+        # This makes a run that staged no skills easy to spot (global=0 means the
+        # copy found nothing at skills_dir).
         if self.skills_dir:
             src = shlex.quote(self.skills_dir)
             await self.exec_as_agent(
                 environment,
                 command=(
-                    f'echo "kiro-skills: HOME=$HOME src={self.skills_dir}"; '
-                    f"mkdir -p ~/.kiro/skills && "
+                    f"mkdir -p ~/.kiro/skills /logs/agent && "
                     f"cp -r {src}/* ~/.kiro/skills/ 2>/dev/null || true; "
-                    f'echo "kiro-skills: global=$(ls ~/.kiro/skills 2>/dev/null | wc -l)"'
+                    f'{{ echo "kiro-skills: HOME=$HOME src={self.skills_dir}"; '
+                    f'echo "kiro-skills: global=$(ls ~/.kiro/skills 2>/dev/null | wc -l)"; }} '
+                    f"| tee /logs/agent/kiro-skills.log"
                 ),
                 env=env or None,
             )
