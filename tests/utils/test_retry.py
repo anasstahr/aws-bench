@@ -1,16 +1,21 @@
-"""Tests for the shared git-fetch retry policy (``retrying_git_fetch``).
+"""Test shared retry policies without real backoff waits."""
 
-The backoff is neutralized by the autouse ``_no_git_fetch_backoff`` fixture (in
-the tests' conftest) so these assert retry *behavior* without sleeping through
-the real 5-60s exponential waits.
-"""
-
+import asyncio
 import subprocess
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from botocore.exceptions import BotoCoreError, ClientError
+import tenacity
+from botocore.exceptions import BotoCoreError, ClientError, ReadTimeoutError
 
-from aws_bench.utils.retry import is_fresh_account_transient, retrying_git_fetch
+from aws_bench.utils.retry import (
+    is_fresh_account_transient,
+    is_region_access_transient,
+    is_scp_access_denied,
+    retrying_git_fetch,
+    retrying_region_read,
+    retrying_scp_rejected_write,
+)
 
 
 def _client_error(code: str) -> ClientError:
@@ -103,3 +108,134 @@ async def test_does_not_retry_other_exceptions():
     with pytest.raises(FileNotFoundError):
         await retrying_git_fetch(hard_fail)
     assert calls["n"] == 1
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "AccessDeniedException", "UnauthorizedOperation"])
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("with an explicit deny in a service control policy", True),
+        ("Denied by a SERVICE CONTROL POLICY", True),
+        ("no identity-based policy allows this action", False),
+        ("explicit deny in a permissions boundary", False),
+        ("", False),
+    ],
+)
+def test_scp_access_denied_is_precise(code: str, message: str, expected: bool) -> None:
+    exc = ClientError({"Error": {"Code": code, "Message": message}}, "ListStacks")
+    assert is_scp_access_denied(exc) is expected
+    assert is_region_access_transient(exc) is expected
+    assert not is_fresh_account_transient(exc)
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (_client_error("OptInRequired"), True),
+        (_client_error("SubscriptionRequiredException"), True),
+        (_client_error("InvalidClientTokenId"), True),
+        (_client_error("AuthFailure"), True),
+        (_client_error("AccessDenied"), False),
+        (ClientError({"Error": {"Code": "AccessDenied"}}, "ListStacks"), False),
+        (
+            ClientError(
+                {"Error": {"Code": "ValidationError", "Message": "service control policy"}},
+                "ListStacks",
+            ),
+            False,
+        ),
+        (BotoCoreError(), False),
+        (RuntimeError("service control policy"), False),
+    ],
+)
+def test_region_access_transient_classifier(exc: BaseException, expected: bool) -> None:
+    assert is_region_access_transient(exc) is expected
+    assert not is_scp_access_denied(exc)
+    if isinstance(exc, ClientError) and exc.response["Error"]["Code"] == "AuthFailure":
+        assert not is_fresh_account_transient(exc)
+
+
+def test_region_read_retries_scp_then_returns_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = retrying_region_read.retry  # type: ignore[attr-defined]
+    monkeypatch.setattr(controller, "wait", tenacity.wait_none())
+    error = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "explicit deny in a service control policy"}},
+        "ListStacks",
+    )
+    operation = MagicMock(side_effect=[error, {"StackSummaries": []}])
+    assert retrying_region_read(operation) == {"StackSummaries": []}
+    assert operation.call_count == 2
+
+
+def test_region_read_exhausts_time_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [0.0]
+
+    def advance_clock(seconds: float) -> None:
+        clock[0] += seconds
+
+    controller = retrying_region_read.retry  # type: ignore[attr-defined]
+    monkeypatch.setattr("tenacity.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(controller, "sleep", advance_clock)
+    monkeypatch.setattr(controller, "wait", tenacity.wait_fixed(30))
+    error = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "explicit deny in a service control policy"}},
+        "ListStacks",
+    )
+    operation = MagicMock(side_effect=error)
+    with pytest.raises(ClientError) as caught:
+        retrying_region_read(operation)
+    assert caught.value is error
+    assert clock[0] == 180
+    assert operation.call_count == 7
+
+
+@pytest.mark.parametrize("error", [_client_error("AccessDenied"), BotoCoreError()])
+def test_region_read_does_not_retry_other_errors(error: BaseException) -> None:
+    operation = MagicMock(side_effect=error)
+    with pytest.raises(type(error)) as caught:
+        retrying_region_read(operation)
+    assert caught.value is error
+    operation.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_scp_rejected_write_exhausts_time_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [0.0]
+
+    async def advance_clock(seconds: float) -> None:
+        clock[0] += seconds
+
+    controller = retrying_scp_rejected_write.retry  # type: ignore[attr-defined]
+    monkeypatch.setattr("tenacity.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(controller, "sleep", advance_clock)
+    monkeypatch.setattr(controller, "wait", tenacity.wait_fixed(30))
+    error = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "explicit deny in a service control policy"}},
+        "EnableRegion",
+    )
+    operation = AsyncMock(side_effect=error)
+    with pytest.raises(ClientError) as caught:
+        await retrying_scp_rejected_write(operation)
+    assert caught.value is error
+    assert clock[0] == 180
+    assert operation.await_count == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        _client_error("AccessDenied"),
+        _client_error("AuthFailure"),
+        _client_error("OptInRequired"),
+        _client_error("ConflictException"),
+        ReadTimeoutError(endpoint_url="https://account.us-east-1.amazonaws.com"),
+        asyncio.CancelledError(),
+    ],
+)
+async def test_scp_rejected_write_does_not_retry_other_errors(error: BaseException) -> None:
+    operation = AsyncMock(side_effect=error)
+    with pytest.raises(type(error)) as caught:
+        await retrying_scp_rejected_write(operation)
+    assert caught.value is error
+    operation.assert_awaited_once_with()
