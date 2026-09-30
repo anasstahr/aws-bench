@@ -22,6 +22,7 @@ import json
 import os
 import shlex
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,18 @@ _CONTAINER_SESSIONS_DIR = "~/.kiro/sessions"
 # kiro-cli installs into $HOME/.local/bin which is not on PATH for non-login
 # shells spawned by environment.exec.
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
+# How long (ms) v1 waits for MCP servers at startup; the ~30 s default is too short for cold uvx.
+_MCP_NO_INTERACTIVE_TIMEOUT_MS = 120_000
+# v3 starts stdio MCP servers with a minimal environment; pass the trial's AWS
+# profile and region selectors explicitly. Raw keys are never written.
+_MCP_SERVER_ENV_VARS = (
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+)
 
 
 class KiroCli(BaseInstalledAgent):
@@ -101,6 +114,7 @@ class KiroCli(BaseInstalledAgent):
     @staticmethod
     def _build_mcp_json(
         servers: list[MCPServerConfig],
+        stdio_env: Mapping[str, str] | None = None,
     ) -> dict[str, dict[str, Any]] | None:
         """Build Kiro CLI MCP server config dict from Harbor's MCPServerConfig list."""
         if not servers:
@@ -112,14 +126,23 @@ class KiroCli(BaseInstalledAgent):
                     "command": server.command,
                     "args": server.args,
                 }
+                if stdio_env:
+                    entry["env"] = dict(stdio_env)
             else:
                 entry = {"url": server.url}
+            # v3 otherwise starts the first turn before slow servers are connected
+            entry["waitForReady"] = True
             mcp_servers[server.name] = entry
         return mcp_servers
 
     def _kiro_env(self) -> dict[str, str]:
         """Collect Kiro CLI env vars from the host."""
         return {"KIRO_API_KEY": os.environ.get("KIRO_API_KEY", "")}
+
+    def _mcp_server_env(self, env: Mapping[str, str]) -> dict[str, str]:
+        """Non-empty AWS selectors for stdio MCP servers, with Harbor's exec precedence."""
+        merged = {**env, **self._extra_env}
+        return {name: merged[name] for name in _MCP_SERVER_ENV_VARS if merged.get(name)}
 
     async def setup(self, environment: BaseEnvironment) -> None:
         """Validate KIRO_API_KEY before spending time on install."""
@@ -176,7 +199,7 @@ class KiroCli(BaseInstalledAgent):
         env = self._kiro_env()
 
         # Write MCP server config if any servers are configured
-        mcp_servers = self._build_mcp_json(self.mcp_servers)
+        mcp_servers = self._build_mcp_json(self.mcp_servers, self._mcp_server_env(env))
         if mcp_servers:
             mcp_json_str = json.dumps({"mcpServers": mcp_servers}, indent=2)
             escaped_mcp = shlex.quote(mcp_json_str)
@@ -184,6 +207,8 @@ class KiroCli(BaseInstalledAgent):
                 environment,
                 command=(
                     f"mkdir -p ~/.kiro/settings && echo {escaped_mcp} > ~/.kiro/settings/mcp.json"
+                    f" && {_PATH_PREFIX}kiro-cli settings mcp.noInteractiveTimeout"
+                    f" {_MCP_NO_INTERACTIVE_TIMEOUT_MS}"
                 ),
                 env=env or None,
             )
