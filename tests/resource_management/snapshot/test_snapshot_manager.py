@@ -10,8 +10,13 @@ import pytest
 import tenacity
 from botocore.exceptions import ClientError
 from moto import mock_aws
+from pytest_mock import MockerFixture
 
-from aws_bench.resource_management.exceptions import DriftDetectionError, SnapshotNotFoundError
+from aws_bench.resource_management.exceptions import (
+    DriftDetectionError,
+    SnapshotNotFoundError,
+    SnapshotRegionMismatchError,
+)
 from aws_bench.resource_management.snapshot.manager import SnapshotManager
 from aws_bench.resource_management.snapshot.models import (
     DriftBaseline,
@@ -23,6 +28,8 @@ from aws_bench.resource_management.snapshot.models import (
     StackMetadata,
 )
 from aws_bench.resource_management.storage.exceptions import StorageConflictError
+from aws_bench.resource_management.storage.local_storage_backend import LocalStorageBackend
+from aws_bench.resource_management.storage.s3_backend import S3StorageBackend
 
 
 def create_test_manager() -> SnapshotManager:
@@ -43,6 +50,34 @@ def temp_snapshot_dir():
     """Create temporary directory for snapshots."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
+
+
+def test_preexisting_mode_stores_state_on_local_disk(tmp_path, monkeypatch, sample_snapshot):
+    """Pre-existing mode resolves the local backend and writes the snapshot under STATE_DIR."""
+    monkeypatch.setattr(
+        "aws_bench.resource_management.snapshot.manager.STATE_DIR", tmp_path / "state"
+    )
+    monkeypatch.setattr(
+        "aws_bench.resource_management.snapshot.manager.active_account_config",
+        lambda: (MagicMock(), Path("accounts.yaml")),
+    )
+    manager = SnapshotManager()
+
+    assert isinstance(manager._storage, LocalStorageBackend)
+
+    manager.save_snapshot("env-test", sample_snapshot)
+
+    written = tmp_path / "state/snapshots/env-test/post-setup/123456789012/baseline.json"
+    assert json.loads(written.read_text())["account_id"] == "123456789012"
+
+
+def test_managed_mode_still_uses_the_s3_state_bucket(monkeypatch):
+    monkeypatch.setattr(
+        "aws_bench.resource_management.snapshot.manager.active_account_config", lambda: None
+    )
+    with mock_aws():
+        manager = create_test_manager()
+        assert isinstance(manager._storage, S3StorageBackend)
 
 
 @pytest.fixture
@@ -80,13 +115,13 @@ def test_snapshot_manager_initialization(temp_snapshot_dir):
     """
     manager = create_test_manager()
     # S3 backend is not initialized yet (lazy)
-    assert manager._s3_backend is None
+    assert manager._backend is None
     assert manager._etags == {}
 
     # Access _storage property to trigger lazy initialization
     storage = manager._storage
     assert storage is not None
-    assert manager._s3_backend is not None
+    assert manager._backend is not None
 
 
 @mock_aws
@@ -102,7 +137,7 @@ def test_lazy_initialization_avoids_s3_cost_for_non_storage_operations(temp_snap
     manager = create_test_manager()
 
     # S3 backend is not initialized on construction
-    assert manager._s3_backend is None
+    assert manager._backend is None
 
     # Verify S3 is only initialized when storage operations are called
     # (not when CloudFormation-only code paths run)
@@ -178,6 +213,49 @@ def test_load_snapshot_corrupted_json(temp_snapshot_dir, sample_snapshot):
     # Loading should raise JSONDecodeError, not SnapshotNotFoundError
     with pytest.raises(json.JSONDecodeError):
         manager.load_snapshot("test-env", "123456789012")
+
+
+@pytest.mark.parametrize("stored_regions", [["us-east-1", "us-west-2"], ["us-west-2", "us-east-1"]])
+def test_validate_pre_setup_snapshot_accepts_equal_sets(sample_snapshot, stored_regions):
+    manager = SnapshotManager()
+    sample_snapshot.regions = stored_regions
+    with patch.object(manager, "load_snapshot", return_value=sample_snapshot) as load:
+        manager.validate_pre_setup_snapshot(
+            "sc", sample_snapshot.account_id, ["us-east-1", "us-west-2"]
+        )
+
+    load.assert_called_once_with("sc", sample_snapshot.account_id, SnapshotStage.PRE_SETUP)
+
+
+@pytest.mark.parametrize(
+    "stored_regions",
+    [["us-east-1"], ["us-west-2", "us-east-1", "eu-west-1"], ["eu-west-1", "us-east-1"]],
+    ids=["added", "removed", "swapped"],
+)
+def test_validate_pre_setup_snapshot_rejects_changed_regions(sample_snapshot, stored_regions):
+    manager = SnapshotManager()
+    sample_snapshot.regions = stored_regions
+    with patch.object(manager, "load_snapshot", return_value=sample_snapshot):
+        with pytest.raises(SnapshotRegionMismatchError) as exc_info:
+            manager.validate_pre_setup_snapshot(
+                "sc", sample_snapshot.account_id, ["us-west-2", "us-east-1"]
+            )
+
+    message = str(exc_info.value)
+    assert "['us-east-1', 'us-west-2']" in message
+    assert str(sorted(stored_regions)) in message
+    assert "Restore the previous regions in scenario.toml" in message
+
+
+def test_validate_pre_setup_snapshot_missing_baseline(sample_snapshot):
+    manager = SnapshotManager()
+    missing = SnapshotNotFoundError("sc", sample_snapshot.account_id, SnapshotStage.PRE_SETUP)
+    with patch.object(manager, "load_snapshot", side_effect=missing):
+        manager.validate_pre_setup_snapshot(
+            "sc", sample_snapshot.account_id, ["us-east-1"], allow_missing=True
+        )
+        with pytest.raises(SnapshotNotFoundError):
+            manager.validate_pre_setup_snapshot("sc", sample_snapshot.account_id, ["us-east-1"])
 
 
 @mock_aws
@@ -806,11 +884,64 @@ def test_snapshot_account_writes_local_file_and_skips_s3(temp_snapshot_dir, mock
 
 
 # ===========================================================================
-# Fresh-account subscription retry — _list_active_stacks self-heals OptInRequired
-#
-# _list_active_stacks is the snapshot's first CloudFormation call, so it is the
-# one place an unconverged subscription surfaces (OptInRequired) on a fresh
-# account; the retry lives there, not on the whole capture_snapshot orchestration.
+# snapshot_account — forbidden-identifier guard (defense-in-depth)
+# ===========================================================================
+
+
+@mock_aws
+def test_snapshot_account_refuses_baseline_with_forbidden_identifier(temp_snapshot_dir, mocker):
+    """A captured baseline containing a flagged orphan is refused, never saved."""
+    manager = create_test_manager()
+
+    captured = _region_snapshot("us-east-1", stack="stack-e1", resource_id="vpc-orphan")
+    mocker.patch.object(manager, "capture_snapshot_multiregion", return_value=captured)
+    save_spy = mocker.patch.object(manager, "save_snapshot")
+
+    ctx = SnapshotContext(
+        scenario_id="my-scenario",
+        scenario_hash="hash1",
+        regions=["us-east-1"],
+        stage=SnapshotStage.POST_SETUP,
+        account_ids=["123456789012"],
+        forbidden_identifiers={"vpc-orphan"},
+    )
+
+    session = boto3.Session(region_name="us-east-1")
+    result = manager.snapshot_account(session, "123456789012", ctx)
+
+    assert result.success is False
+    assert result.error_message is not None
+    assert "vpc-orphan" in result.error_message
+    save_spy.assert_not_called()
+
+
+@mock_aws
+def test_snapshot_account_saves_when_forbidden_identifiers_absent(temp_snapshot_dir, mocker):
+    """A non-intersecting (or empty) forbidden set does not block the normal save."""
+    manager = create_test_manager()
+
+    captured = _region_snapshot("us-east-1", stack="stack-e1", resource_id="role-e1")
+    mocker.patch.object(manager, "capture_snapshot_multiregion", return_value=captured)
+    save_spy = mocker.patch.object(manager, "save_snapshot")
+
+    ctx = SnapshotContext(
+        scenario_id="my-scenario",
+        scenario_hash="hash1",
+        regions=["us-east-1"],
+        stage=SnapshotStage.POST_SETUP,
+        account_ids=["123456789012"],
+        forbidden_identifiers={"vpc-not-present"},
+    )
+
+    session = boto3.Session(region_name="us-east-1")
+    result = manager.snapshot_account(session, "123456789012", ctx)
+
+    assert result.success is True
+    save_spy.assert_called_once()
+
+
+# ===========================================================================
+# _list_active_stacks retries region-access errors
 # ===========================================================================
 
 
@@ -847,16 +978,31 @@ def _cfn_with_paginate(mocker, *, paginate_side_effect):
     return mock_cfn, paginator
 
 
-def test_list_active_stacks_retries_then_succeeds_on_optin_required(_instant_stacks_retry, mocker):
-    """A fresh-account OptInRequired on the first calls clears and the listing succeeds."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        _client_error("OptInRequired"),
+        ClientError(
+            {
+                "Error": {
+                    "Code": "AccessDenied",
+                    "Message": "explicit deny in a service control policy",
+                }
+            },
+            "ListStacks",
+        ),
+    ],
+)
+def test_list_active_stacks_retries_then_succeeds_on_regional_access_error(
+    _instant_stacks_retry: None, mocker: MockerFixture, error: ClientError
+) -> None:
     manager = create_test_manager()
 
-    # First two ListStacks calls fail with OptInRequired, third returns no stacks.
     mock_cfn, paginator = _cfn_with_paginate(
         mocker,
         paginate_side_effect=[
-            _client_error("OptInRequired"),
-            _client_error("OptInRequired"),
+            error,
+            error,
             [{"StackSummaries": []}],
         ],
     )
@@ -868,7 +1014,7 @@ def test_list_active_stacks_retries_then_succeeds_on_optin_required(_instant_sta
 
 
 def test_list_active_stacks_does_not_retry_non_transient_error(_instant_stacks_retry, mocker):
-    """A non-subscription ClientError (AccessDenied) surfaces on the first attempt."""
+    """An AccessDenied that does not cite an SCP surfaces on the first attempt."""
     manager = create_test_manager()
 
     mock_cfn, paginator = _cfn_with_paginate(
@@ -883,28 +1029,36 @@ def test_list_active_stacks_does_not_retry_non_transient_error(_instant_stacks_r
     assert paginator.paginate.call_count == 1
 
 
-def test_list_active_stacks_reraises_original_error_after_budget(mocker):
-    """When the transient error never clears, the budget stops retry and reraises.
-
-    Overrides stop with stop_after_attempt so the budget is deterministic, and
-    asserts the ORIGINAL OptInRequired ClientError surfaces (reraise=True), not a
-    tenacity RetryError — so snapshot_account records the real cause.
-    """
+@pytest.mark.parametrize(
+    "error",
+    [
+        _client_error("OptInRequired"),
+        ClientError(
+            {
+                "Error": {
+                    "Code": "AccessDenied",
+                    "Message": "explicit deny in a service control policy",
+                }
+            },
+            "ListStacks",
+        ),
+    ],
+)
+def test_list_active_stacks_reraises_original_error_after_budget(
+    mocker: MockerFixture, error: ClientError
+) -> None:
     manager = create_test_manager()
 
-    # tenacity attaches the .retry controller at runtime; the stubs don't model it.
     controller = SnapshotManager._list_active_stacks.retry  # type: ignore[attr-defined]
     mocker.patch.object(controller, "wait", tenacity.wait_none())
     mocker.patch.object(controller, "stop", tenacity.stop_after_attempt(3))
 
-    mock_cfn, paginator = _cfn_with_paginate(
-        mocker, paginate_side_effect=_client_error("OptInRequired")
-    )
+    mock_cfn, paginator = _cfn_with_paginate(mocker, paginate_side_effect=error)
 
     with pytest.raises(ClientError) as exc_info:
         manager._list_active_stacks(mock_cfn)
 
-    assert exc_info.value.response["Error"]["Code"] == "OptInRequired"
+    assert exc_info.value is error
     assert paginator.paginate.call_count == 3
 
 

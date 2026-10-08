@@ -51,6 +51,11 @@ SUPERSEDED_BY_CUSTOM_LISTER: frozenset[tuple[str, str]] = frozenset(
         ("acm-pca", "ListCertificateAuthorities"),  # → AWS::ACMPCA::CertificateAuthority
         ("amp", "ListWorkspaces"),  # → AWS::APS::Workspace
         ("amp", "ListScrapers"),  # → AWS::APS::Scraper
+        # The simple no-arg list_services defaults to the "default" cluster and raises
+        # ClusterNotFoundException when it is absent (fresh/scenario accounts have none),
+        # falsely marking AWS::ECS::Service un-enumerable. The custom lister iterates every
+        # cluster and emits the CCAPI composite id serviceArn|cluster.
+        ("ecs", "list_services"),  # → AWS::ECS::Service
         ("ec2", "DescribeAddresses"),  # → AWS::EC2::EIP
         # Default-VPC exclusion: the simple row returns the default VPC's associated
         # set, which is undeletable and must not surface as an orphan.
@@ -60,6 +65,7 @@ SUPERSEDED_BY_CUSTOM_LISTER: frozenset[tuple[str, str]] = frozenset(
         # the CustomLister runs the caller-scoped API instead.
         ("ec2", "DescribeManagedPrefixLists"),  # → AWS::EC2::PrefixList
         ("ec2", "DescribeVpcEndpointServiceConfigurations"),  # → AWS::EC2::VPCEndpointService
+        ("gamelift", "list_locations"),  # → AWS::GameLift::Location
         ("lexv2-models", "ListBots"),  # → AWS::Lex::Bot
         ("mq", "ListBrokers"),  # → AWS::AmazonMQ::Broker
         ("mq", "ListConfigurations"),  # → AWS::AmazonMQ::Configuration
@@ -102,6 +108,11 @@ DISABLED_LISTERS: frozenset[tuple[str, str]] = frozenset(
         # parallel multi-region snapshot and aborts the whole capture (observed in
         # ap-northeast-3). Not a benchmark resource, so disabling the lister is safe.
         ("sagemaker", "ListPartnerApps"),
+        # Telco Network Builder: deprecated service and not part of dataset resources.
+        ("tnb", "ListSolFunctionInstances"),
+        ("tnb", "ListSolFunctionPackages"),
+        ("tnb", "ListSolNetworkInstances"),
+        ("tnb", "ListSolNetworkPackages"),
     }
 )
 

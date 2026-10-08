@@ -1,7 +1,10 @@
 """Tests for the assembled lister set: all_listers() + supersession + cfn_type_pins()."""
 
 from aws_bench.resource_management.fastscan.listers import all_listers, cfn_type_pins
-from aws_bench.resource_management.fastscan.listers.custom_listers import custom_listers
+from aws_bench.resource_management.fastscan.listers.custom_listers import (
+    custom_listers,
+    list_gamelift_custom_locations,
+)
 from aws_bench.resource_management.fastscan.listers.lister_registry import (
     DISABLED_LISTERS,
     SUPERSEDED_BY_CUSTOM_LISTER,
@@ -17,6 +20,25 @@ def test_all_listers_excludes_superseded_and_disabled():
         assert key not in keys or key in code_keys
     for key in DISABLED_LISTERS:
         assert key not in keys, f"disabled lister {key} must not run"
+
+
+def test_ecs_list_services_simple_lister_is_superseded():
+    """The broken no-arg simple ecs:list_services row must be superseded by the custom lister.
+
+    The simple row defaults to the "default" cluster and raises ClusterNotFoundException when
+    it is absent, falsely marking AWS::ECS::Service un-enumerable. The custom lister iterates
+    every cluster, so only it runs for AWS::ECS::Service.
+    """
+    assert ("ecs", "list_services") in SUPERSEDED_BY_CUSTOM_LISTER
+    # It is a real simple lister (so the supersede is not a dead entry) ...
+    assert ("ecs", "list_services") in {(x.service, x.op) for x in SIMPLE_LISTERS}
+    # ... and it does not run in the assembled set.
+    assert ("ecs", "list_services") not in {(x.service, x.op) for x in all_listers()}
+    # The custom lister remains the sole writer for AWS::ECS::Service.
+    ecs_service_writers = [
+        (c.service, c.op) for c in custom_listers() if c.cfn_type == "AWS::ECS::Service"
+    ]
+    assert ecs_service_writers == [("ecs", "ListServices")]
 
 
 def test_disabled_listers_are_real_simple_listers():
@@ -81,6 +103,22 @@ def test_all_listers_has_no_duplicate_scan_keys():
     keys = [f"{lister.service}:{lister.op}" for lister in all_listers()]
     dupes = sorted({k for k in keys if keys.count(k) > 1})
     assert not dupes, f"duplicate scan keys would crash scan(): {dupes}"
+
+
+def test_gamelift_list_locations_simple_lister_is_superseded():
+    """The no-arg simple gamelift:list_locations row must yield to the CUSTOM-filtered lister.
+
+    The simple row returns every AWS-managed Region / Local Zone location, which is undeletable
+    and absent from any snapshot, so it would surface as a new resource on every verify.
+    """
+    assert ("gamelift", "list_locations") in SUPERSEDED_BY_CUSTOM_LISTER
+    assert ("gamelift", "list_locations") in {(x.service, x.op) for x in SIMPLE_LISTERS}
+    # The custom lister reuses the row's op key (so the generated region-skip entry still
+    # applies), so exactly one lister runs under it: the custom one.
+    running = [x for x in all_listers() if (x.service, x.op) == ("gamelift", "list_locations")]
+    assert len(running) == 1
+    assert running[0].run is list_gamelift_custom_locations
+    assert running[0].cfn_type == "AWS::GameLift::Location"
 
 
 def test_superseded_table_op_never_runs_as_a_table_lister():

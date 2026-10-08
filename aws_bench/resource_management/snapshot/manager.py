@@ -16,10 +16,15 @@ import tenacity
 from botocore.exceptions import BotoCoreError, ClientError
 
 from aws_bench.account_management.constants import ORG_ACCESS_ROLE
+from aws_bench.account_management.preexisting import active_account_config
+from aws_bench.constants import STATE_DIR
 from aws_bench.logging.logger import get_logger, log_context
 from aws_bench.resource_management.ccapi.models import MAX_WORKERS_ACCOUNT, MAX_WORKERS_HEAVY
-from aws_bench.resource_management.constants import RESOURCE_MANAGEMENT_SESSION
-from aws_bench.resource_management.exceptions import DriftDetectionError, SnapshotNotFoundError
+from aws_bench.resource_management.exceptions import (
+    DriftDetectionError,
+    SnapshotNotFoundError,
+    SnapshotRegionMismatchError,
+)
 from aws_bench.resource_management.fastscan.engine import _TRANSIENT_SERVER_CODES
 from aws_bench.resource_management.scanner import make_scanner, scan_method
 from aws_bench.resource_management.snapshot.drift import (
@@ -37,10 +42,12 @@ from aws_bench.resource_management.snapshot.models import (
     SnapshotStage,
     StackMetadata,
 )
+from aws_bench.resource_management.storage import SnapshotStorage
 from aws_bench.resource_management.storage.exceptions import (
     StorageConflictError,
     StorageNotFoundError,
 )
+from aws_bench.resource_management.storage.local_storage_backend import LocalStorageBackend
 from aws_bench.resource_management.storage.s3_backend import S3StorageBackend
 from aws_bench.utils.concurrent import build_client, interruptible_executor, raise_if_shutdown
 from aws_bench.utils.credentials_provider import (
@@ -48,7 +55,7 @@ from aws_bench.utils.credentials_provider import (
     build_session_name,
     create_regional_session,
 )
-from aws_bench.utils.retry import is_fresh_account_transient
+from aws_bench.utils.retry import is_region_access_transient
 
 logger = get_logger(__name__)
 
@@ -58,30 +65,35 @@ STATE_BUCKET_PREFIX = "awsbench-state-"
 class SnapshotManager:
     """Manages snapshot capture and loading operations.
 
-    S3 backend is lazily initialized on first storage access to avoid paying
+    The storage backend is lazily initialized on first access to avoid paying
     the initialization cost (STS get_caller_identity + S3 head_bucket + 4 config PUTs)
     in code paths that only use CloudFormation APIs (e.g., drift capture).
     """
 
     def __init__(self):
-        """Initialize snapshot manager.
-
-        S3 backend is created lazily on first storage access via the _storage property.
-        """
-        self._s3_backend: S3StorageBackend | None = None
+        """Initialize snapshot manager."""
+        self._backend: SnapshotStorage | None = None
         self._etags: dict[SnapshotKey, str] = {}
 
     @property
-    def _storage(self) -> S3StorageBackend:
-        """Lazily initialize S3 backend on first storage access.
+    def _storage(self) -> SnapshotStorage:
+        """Lazily initialize the storage backend on first access.
 
-        Auto-derives bucket name from management account ID (awsbench-state-{account-id}).
-        This avoids paying the initialization cost in code paths that never touch S3.
+        Pre-existing mode has no management account to hold a state bucket, and a
+        bucket in the account under test would put benchmark state inside the
+        agent's blast radius, so state goes to host-local disk instead. Managed
+        mode derives its bucket from the management account
+        (``awsbench-state-{account-id}``).
 
         Returns:
-            Initialized S3StorageBackend instance
+            Initialized storage backend
         """
-        if self._s3_backend is None:
+        if self._backend is None:
+            if active_account_config() is not None:
+                logger.debug(f"Initializing local storage backend at {STATE_DIR} (lazy)")
+                self._backend = LocalStorageBackend(root=STATE_DIR)
+                return self._backend
+
             logger.debug("Initializing S3 storage backend (lazy)")
             mgmt_session = CredentialProvider.get().get_management_session()
 
@@ -92,15 +104,15 @@ class SnapshotManager:
             state_bucket = f"{STATE_BUCKET_PREFIX}{account_id}"
 
             # Create S3 storage backend
-            self._s3_backend = S3StorageBackend(
+            self._backend = S3StorageBackend(
                 session=mgmt_session,
                 bucket_name=state_bucket,
             )
 
-        return self._s3_backend
+        return self._backend
 
     def _make_s3_key(self, env_name: str, account_id: str, stage: SnapshotStage) -> str:
-        """Return the S3 key for a snapshot."""
+        """Return the storage key for a snapshot."""
         return f"{env_name}/{stage}/{account_id}/baseline.json"
 
     def _get_snapshot_key(
@@ -202,6 +214,24 @@ class SnapshotManager:
 
         return snapshot
 
+    def validate_pre_setup_snapshot(
+        self,
+        scenario_name: str,
+        account_id: str,
+        regions: list[str],
+        *,
+        allow_missing: bool = False,
+    ) -> None:
+        """Require a PRE_SETUP baseline whose region set equals ``regions``."""
+        try:
+            baseline = self.load_snapshot(scenario_name, account_id, SnapshotStage.PRE_SETUP)
+        except SnapshotNotFoundError:
+            if allow_missing:
+                return
+            raise
+        if set(baseline.regions) != set(regions):
+            raise SnapshotRegionMismatchError(scenario_name, account_id, regions, baseline.regions)
+
     def snapshot_exists(
         self, env_name: str, account_id: str, stage: SnapshotStage = SnapshotStage.POST_SETUP
     ) -> bool:
@@ -234,7 +264,7 @@ class SnapshotManager:
 
     # Sequential per account+region, so it can afford a long convergence budget.
     @tenacity.retry(
-        retry=tenacity.retry_if_exception(is_fresh_account_transient),
+        retry=tenacity.retry_if_exception(is_region_access_transient),
         wait=tenacity.wait_exponential(multiplier=2, min=10, max=60) + tenacity.wait_random(0, 5),
         stop=tenacity.stop_after_delay(180),
         reraise=True,
@@ -242,8 +272,7 @@ class SnapshotManager:
     def _list_active_stacks(self, cfn: Any) -> list[dict[str, Any]]:
         """List active CloudFormation stacks (exclude deleted and nested stacks).
 
-        The snapshot's first AWS call, so a fresh account's unconverged subscription
-        surfaces here (see is_fresh_account_transient); the decorator retries it.
+        The snapshot's first AWS call, so it carries the region-access retry.
         """
         logger.debug("Listing CloudFormation stacks")
         stacks = []
@@ -583,6 +612,23 @@ class SnapshotManager:
             snapshot = self.capture_snapshot_multiregion(
                 scan_session, account_id, ctx.scenario_id, ctx.scenario_hash, ctx.regions
             )
+            # Defense-in-depth: never persist a baseline that still contains a resource
+            # a caller flagged as an unresolved orphan (would hide it forever).
+            if ctx.forbidden_identifiers:
+                present = sorted(
+                    ident
+                    for ids in snapshot.resource_ids.values()
+                    for item in ids
+                    if (ident := item.get("Identifier", "")) in ctx.forbidden_identifiers
+                )
+                if present:
+                    msg = (
+                        f"Refused to save {ctx.stage} baseline for "
+                        f"{ctx.scenario_id}/{account_id}: still contains "
+                        f"{len(present)} flagged orphan(s): {', '.join(present[:5])}"
+                    )
+                    logger.error(msg)
+                    return SnapshotResult(account_id=account_id, success=False, error_message=msg)
             if ctx.output_dir is not None:
                 path = self._write_snapshot_file(ctx.output_dir, ctx.scenario_id, snapshot)
                 logger.debug(
@@ -647,7 +693,7 @@ class SnapshotManager:
                 session = cred_provider.get_session_for_account(
                     account_id,
                     ORG_ACCESS_ROLE,
-                    build_session_name(RESOURCE_MANAGEMENT_SESSION, f"snapshot-{ctx.stage}"),
+                    build_session_name("session"),
                 )
                 return self.snapshot_account(session, account_id, ctx)
 
