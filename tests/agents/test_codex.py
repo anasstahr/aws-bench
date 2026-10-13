@@ -268,3 +268,71 @@ class TestCodexAwsMcpHardening:
             "command": "uvx",
             "args": ["some-other-proxy@latest"],
         }
+
+
+@pytest.mark.asyncio
+class TestCodexBedrockModelRegion:
+    """The Bedrock provider region is pinned in config.toml, independent of AWS_REGION.
+
+    aws-bench sets AWS_REGION to the scenario region for the agent phase; Codex's
+    bearer-token auth prefers ``model_providers.amazon-bedrock.aws.region`` over it.
+    """
+
+    @staticmethod
+    async def _written_provider_toml(agent: Codex) -> dict:
+        captured: list[str] = []
+
+        async def fake_exec(_environment, command, **_kwargs):
+            captured.append(command)
+
+        agent.exec_as_agent = fake_exec  # type: ignore[method-assign]
+        await agent._write_bedrock_provider_config(MagicMock())
+        (command,) = captured
+        body = command.split("echo ", 1)[1].rsplit(' >> "$CODEX_HOME/config.toml"', 1)[0]
+        import shlex
+
+        return tomllib.loads(shlex.split(body)[0])
+
+    async def test_defaults_to_us_east_1(self, logs_dir: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("CODEX_BEDROCK_MODEL_REGION", raising=False)
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        parsed = await self._written_provider_toml(Codex(logs_dir=logs_dir))
+        assert parsed["model_provider"] == "amazon-bedrock"
+        assert parsed["model_providers"]["amazon-bedrock"]["aws"]["region"] == "us-east-1"
+
+    async def test_env_override(self, logs_dir: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CODEX_BEDROCK_MODEL_REGION", "us-west-2")
+        parsed = await self._written_provider_toml(Codex(logs_dir=logs_dir))
+        assert parsed["model_providers"]["amazon-bedrock"]["aws"]["region"] == "us-west-2"
+
+    async def test_kwarg_override_wins(self, logs_dir: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CODEX_BEDROCK_MODEL_REGION", "us-west-2")
+        agent = Codex(logs_dir=logs_dir, bedrock_region="us-east-2")
+        parsed = await self._written_provider_toml(agent)
+        assert parsed["model_providers"]["amazon-bedrock"]["aws"]["region"] == "us-east-2"
+
+    async def test_region_stays_top_level_with_later_keys(self, logs_dir: Path):
+        """Later appended top-level keys (MCP grace) must not land inside a provider table."""
+        agent = Codex(logs_dir=logs_dir)
+        parsed_provider = await self._written_provider_toml(agent)
+        agent.mcp_servers = [
+            _stdio_server("aws-mcp", "uvx", ["mcp-proxy-for-aws-cli@latest", "https://x"])
+        ]
+        mcp_cmd = agent._build_mcp_config_command()
+        assert mcp_cmd is not None
+        provider_toml = (
+            'model_provider = "amazon-bedrock"\n'
+            'model_providers.amazon-bedrock.aws.region = "us-east-1"\n'
+        )
+        combined = provider_toml + "\n" + _parse_written_toml_raw(mcp_cmd)
+        merged = tomllib.loads(combined)
+        assert merged["mcp_optional_startup_grace_ms"] == 0
+        assert merged["model_providers"]["amazon-bedrock"]["aws"] == {"region": "us-east-1"}
+        assert parsed_provider["model_providers"]["amazon-bedrock"]["aws"]["region"] == "us-east-1"
+
+
+def _parse_written_toml_raw(command: str) -> str:
+    import shlex
+
+    body = command.split("echo ", 1)[1].rsplit(' >> "$CODEX_HOME/config.toml"', 1)[0]
+    return shlex.split(body)[0]

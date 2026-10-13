@@ -41,6 +41,13 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 _DEFAULT_AWS_REGION = "us-east-2"
+# Region for Codex's Bedrock model calls. aws-bench pins AWS_REGION/AWS_DEFAULT_REGION
+# to the scenario's region for the agent phase, and Codex's Bedrock bearer-token auth
+# falls back to those env vars, so without a provider-level region every task outside
+# a model's serving region fails with "model ... does not exist". The provider config
+# key wins over the env, so the agent's own AWS calls keep the scenario region.
+_DEFAULT_BEDROCK_MODEL_REGION = "us-east-1"
+_BEDROCK_MODEL_REGION_ENV = "CODEX_BEDROCK_MODEL_REGION"
 
 # --- aws-mcp proxy hardening ------------------------------------------------
 #
@@ -125,12 +132,18 @@ class Codex(_HarborCodex):
         logs_dir: Path,
         marketplaces: list[str] | None = None,
         plugins: list[str] | None = None,
+        bedrock_region: str | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
         """Store marketplace sources and ``<plugin>@<marketplace>`` selectors."""
         self._marketplaces = list(marketplaces) if marketplaces else []
         self._plugins = list(plugins) if plugins else []
+        self._bedrock_region = (
+            bedrock_region
+            or os.environ.get(_BEDROCK_MODEL_REGION_ENV, "").strip()
+            or _DEFAULT_BEDROCK_MODEL_REGION
+        )
         if self._marketplaces and not self._plugins:
             raise ValueError(
                 "marketplaces were given without plugins; a marketplace is only "
@@ -209,9 +222,18 @@ class Codex(_HarborCodex):
 
         We ``mkdir -p`` the home ourselves so this does not depend on harbor's
         own mkdir having run yet (it is idempotent with harbor's).
+
+        The provider region is written as a top-level dotted key
+        (``model_providers.amazon-bedrock.aws.region``) rather than a table, so
+        the top-level keys appended later (e.g. ``mcp_optional_startup_grace_ms``)
+        cannot end up inside it. Codex prefers it over ``AWS_REGION``.
         """
         remote_codex_home = self._REMOTE_CODEX_HOME.as_posix()
-        provider_block = 'model_provider = "amazon-bedrock"\n'
+        provider_block = (
+            'model_provider = "amazon-bedrock"\n'
+            "model_providers.amazon-bedrock.aws.region = "
+            f"{_toml_basic_string(self._bedrock_region)}\n"
+        )
         await self.exec_as_agent(
             environment,
             command=(
