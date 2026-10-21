@@ -62,11 +62,9 @@ _DEFAULT_AWS_REGION = "us-east-2"
 #      the AWS account/profile settings into the subprocess so the server acts
 #      against the intended account.
 #
-# The proxy package is additionally pinned to an exact version rather than the
-# drifting ``@latest`` so startup is reproducible and cannot silently adopt a
-# newer proxy release.
+# The proxy's version spec is passed through unchanged; pinning it is left to
+# whoever supplies the MCP config.
 _AWS_MCP_PROXY_PACKAGE = "mcp-proxy-for-aws-cli"
-_AWS_MCP_PROXY_PIN = f"{_AWS_MCP_PROXY_PACKAGE}==1.7.0"
 _MCP_OPTIONAL_STARTUP_GRACE_MS = 0
 _AWS_MCP_STARTUP_TIMEOUT_SEC = 120
 _AWS_MCP_ENV_VARS = (
@@ -222,36 +220,25 @@ class Codex(_HarborCodex):
         )
 
     @staticmethod
-    def _pin_aws_mcp_proxy(args: list[str]) -> tuple[list[str], bool]:
-        """Pin the ``mcp-proxy-for-aws-cli`` package spec in ``args`` to an exact version.
+    def _is_aws_mcp_proxy(args: list[str]) -> bool:
+        """Return whether ``args`` launch the ``mcp-proxy-for-aws-cli`` proxy.
 
-        The aws-mcp server's args reference the proxy package, but the version
-        drifts because the launching MCP config uses ``@latest``. This
-        rewrites that spec to :data:`_AWS_MCP_PROXY_PIN`, matching the package
-        whether it is unpinned (``mcp-proxy-for-aws-cli``), tagged
-        (``...@latest``), or already ``==`` pinned. Only the package spec token
-        is rewritten; the endpoint URL and every flag are left untouched.
+        Matches the package spec whether it is unpinned
+        (``mcp-proxy-for-aws-cli``), tagged (``...@latest``), or ``==`` pinned.
+        The spec itself is never rewritten.
 
         Args:
             args: The stdio server's argument vector.
 
         Returns:
-            ``(rewritten_args, found)`` where ``found`` is ``True`` iff a proxy
-            spec was present (i.e. this is the uvx aws-mcp proxy server).
+            ``True`` iff a proxy package spec is present in ``args``.
         """
-        rewritten: list[str] = []
-        found = False
-        for arg in args:
-            if (
-                arg == _AWS_MCP_PROXY_PACKAGE
-                or arg.startswith(f"{_AWS_MCP_PROXY_PACKAGE}@")
-                or arg.startswith(f"{_AWS_MCP_PROXY_PACKAGE}==")
-            ):
-                rewritten.append(_AWS_MCP_PROXY_PIN)
-                found = True
-            else:
-                rewritten.append(arg)
-        return rewritten, found
+        return any(
+            arg == _AWS_MCP_PROXY_PACKAGE
+            or arg.startswith(f"{_AWS_MCP_PROXY_PACKAGE}@")
+            or arg.startswith(f"{_AWS_MCP_PROXY_PACKAGE}==")
+            for arg in args
+        )
 
     def _build_register_mcp_servers_command(self) -> str | None:
         """Write MCP config, then install plugins in Harbor's trial CODEX_HOME."""
@@ -289,8 +276,8 @@ class Codex(_HarborCodex):
           key, *above* every ``[mcp_servers.*]`` table, so Codex does not drop a
           server that is slow to start (uvx cold start is 2-4s).
         * For the uvx aws-mcp proxy server (detected by its
-          ``mcp-proxy-for-aws-cli`` arg), the proxy is pinned to an exact
-          version, and ``startup_timeout_sec`` + ``env_vars`` are emitted so the
+          ``mcp-proxy-for-aws-cli`` arg), ``startup_timeout_sec`` + ``env_vars``
+          are emitted so the
           cold start has time to finish and the subprocess inherits the AWS
           account/profile settings (``MCPServerConfig`` itself carries no
           timeout/env field, so these are emitted here rather than modeled).
@@ -309,10 +296,9 @@ class Codex(_HarborCodex):
             lines.append(f"[mcp_servers.{server.name}]")
             if server.transport == "stdio":
                 lines.append(f"command = {_toml_basic_string(server.command or '')}")
-                args, is_aws_mcp_proxy = self._pin_aws_mcp_proxy(list(server.args))
-                rendered_args = ", ".join(_toml_basic_string(arg) for arg in args)
+                rendered_args = ", ".join(_toml_basic_string(arg) for arg in server.args)
                 lines.append(f"args = [{rendered_args}]")
-                if is_aws_mcp_proxy:
+                if self._is_aws_mcp_proxy(server.args):
                     lines.append(f"startup_timeout_sec = {_AWS_MCP_STARTUP_TIMEOUT_SEC}")
                     rendered_env = ", ".join(_toml_basic_string(v) for v in _AWS_MCP_ENV_VARS)
                     lines.append(f"env_vars = [{rendered_env}]")

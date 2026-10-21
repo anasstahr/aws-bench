@@ -182,10 +182,11 @@ class TestCodexMcpServersMixed:
 
 
 class TestCodexAwsMcpHardening:
-    """Pinning and hardening of the aws-mcp (Agent Toolkit) proxy server.
+    """Hardening of the uvx aws-mcp proxy server.
 
     Codex keeps and uses the server thanks to a top-level startup grace, a
-    per-server cold-start timeout, forwarded AWS env, and an exact proxy pin.
+    per-server cold-start timeout, and forwarded AWS env. The proxy's version
+    spec is passed through unchanged.
     """
 
     @staticmethod
@@ -202,7 +203,7 @@ class TestCodexAwsMcpHardening:
             ],
         )
 
-    def test_aws_mcp_proxy_pinned_and_hardened(self, agent: Codex):
+    def test_aws_mcp_proxy_hardened(self, agent: Codex):
         agent.mcp_servers = [self._aws_mcp_server()]
 
         command = agent._build_register_mcp_servers_command()
@@ -213,11 +214,9 @@ class TestCodexAwsMcpHardening:
         assert parsed["mcp_optional_startup_grace_ms"] == 0
 
         block = parsed["mcp_servers"]["aws-mcp"]
-        # Reproducibility: proxy pinned to the exact version the original codex
-        # ATK lanes resolved from @latest, not the drifting @latest itself.
-        assert block["args"][0] == "mcp-proxy-for-aws-cli==1.7.0"
-        # Only the package spec is rewritten; endpoint + flags are untouched.
-        assert block["args"][1:] == [
+        # The user-supplied args (including the version spec) are untouched.
+        assert block["args"] == [
+            "mcp-proxy-for-aws-cli@latest",
             "aws-mcp.us-east-1.api.aws/mcp",
             "--skip-auth",
             "--metadata",
@@ -226,7 +225,7 @@ class TestCodexAwsMcpHardening:
         # Bug 1 (timeout): generous cold-start window for uvx (2-4s).
         assert block["startup_timeout_sec"] == 120
         # Bug 2 (env): forward the AWS account/profile env into the subprocess
-        # so the proxy's boto3 does not fall back to the runner instance role.
+        # so the proxy's boto3 does not fall back to the instance role.
         assert block["env_vars"] == [
             "AWS_PROFILE",
             "AWS_DEFAULT_PROFILE",
@@ -248,17 +247,21 @@ class TestCodexAwsMcpHardening:
         payload = command[command.index("'") + 1 : command.rindex("'")]
         assert payload.index("mcp_optional_startup_grace_ms") < payload.index("[mcp_servers.")
 
-    def test_already_pinned_proxy_is_repinned(self, agent: Codex):
-        # A proxy spec already carrying a (stale) == pin is re-pinned exactly.
+    def test_user_pinned_proxy_is_respected(self, agent: Codex):
+        # An explicit user pin is detected as the proxy (so it is hardened) but
+        # its version spec is left exactly as supplied.
         agent.mcp_servers = [
             _stdio_server("aws-mcp", "uvx", ["mcp-proxy-for-aws-cli==1.6.6", "--skip-auth"])
         ]
         parsed = _parse_written_toml(agent._build_register_mcp_servers_command() or "")
-        assert parsed["mcp_servers"]["aws-mcp"]["args"][0] == "mcp-proxy-for-aws-cli==1.7.0"
+        block = parsed["mcp_servers"]["aws-mcp"]
+        assert block["args"] == ["mcp-proxy-for-aws-cli==1.6.6", "--skip-auth"]
+        assert block["startup_timeout_sec"] == 120
+        assert "env_vars" in block
 
     def test_non_proxy_stdio_server_not_hardened(self, agent: Codex):
         # A stdio server that is not the uvx aws proxy keeps plain command/args
-        # (no pin, no timeout, no env_vars) even if it happens to be named
+        # (no timeout, no env_vars) even if it happens to be named
         # "aws-mcp" — hardening keys off the proxy package spec, not the name.
         agent.mcp_servers = [_stdio_server("aws-mcp", "uvx", ["some-other-proxy@latest"])]
         command = agent._build_register_mcp_servers_command()
